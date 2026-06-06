@@ -1,65 +1,74 @@
 # TemplateCombine
 
-`TemplateCombine` is a .NET 8 Azure Functions isolated worker app that processes XML documents using a Service Bus-driven workflow.
+`TemplateCombine` is a .NET 8 Azure Functions isolated worker app that processes XML documents with XSLT using a Service Bus queue trigger.
 
-## Overview
+## Required Azure resources
 
-The function is triggered by a Service Bus message, reads an XML document from Blob Storage, applies an XSLT template from a `templates` container, writes the transformed result to an `output` container, and can publish a completion message back to Service Bus.
+1. **Azure Storage Account** with blob containers:
+   - `input`
+   - `template`
+   - `output`
+2. **Azure Service Bus namespace** with:
+   - Processing queue (example: `document-processing`)
+   - Optional status queue (example: `document-processing-status`)
+3. **Function App** hosting this project.
 
-## Processing Flow
+## Processing flow
 
-1. A client uploads an XML file to the `input` blob container.
-2. The client sends a Service Bus message to the processing queue.
-3. The `DocumentProcessor` function receives the message.
-4. The function reads the source XML from Blob Storage.
-5. The function loads the XSLT template from the `templates` container.
-6. The function transforms the XML.
-7. The transformed XML is written to the `output` container.
-8. An optional completion message is sent to a status queue.
+1. Upstream system uploads source XML into `input`.
+2. Upstream system sends a Service Bus message to `%ServiceBusQueueName%` with blob + template references.
+3. `DocumentProcessor` function:
+   - Deserializes and validates the request payload.
+   - Reads source XML from `input` by default.
+   - Reads XSLT from `template` by default.
+   - Transforms XML and writes result to `output`.
+   - Preserves workflow/correlation IDs in logs, output blob metadata, and optional status message.
+4. If `%ServiceBusStatusQueueName%` is configured, the function emits a completion/failure status message.
 
-## Service Bus Request Message
+## Service Bus request contract
 
-The processing queue expects a JSON payload like this:
+Expected JSON payload:
 
 ```json
 {
-  "blobName": "document1.xml",
+  "workflowId": "8c4d0f4d-2f40-4a46-a7f8-3b783e0a4f25",
+  "correlationId": "a11c1f03-7569-4f84-b0d0-a2b18ea15af5",
+  "blobName": "requests/request-001.xml",
   "inputContainer": "input",
-  "templateName": "default.xslt",
-  "correlationId": "abc-123"
+  "templateBlobName": "default.xslt",
+  "templateContainer": "template",
+  "outputContainer": "output"
 }
 ```
 
-### Request Fields
+### Request fields
 
-- `blobName` - required; name of the source blob to process.
-- `inputContainer` - optional; defaults to `input`.
-- `templateName` - optional; defaults to `TemplateBlobName` or `default.xslt`.
-- `correlationId` - optional; used for end-to-end tracking.
+- `blobName` (**required**): input blob path/name.
+- `workflowId` (optional): workflow tracking identifier.
+- `correlationId` (optional): correlation identifier for logs/status.
+- `inputContainer` (optional): defaults to app setting `InputContainerName` or `input`.
+- `templateBlobName` (optional): defaults to app setting `TemplateBlobName` or `default.xslt`.
+- `templateContainer` (optional): defaults to app setting `TemplateContainerName` or `template`.
+- `outputContainer` (optional): defaults to app setting `OutputContainerName` or `output`.
 
-## Completion Message
+## Status/completion contract
 
-If `ServiceBusStatusQueueName` is configured, the function sends a completion message containing:
+When status queue is configured, the function publishes JSON payloads with:
 
+- `status` (`Completed` or `Failed`)
+- `workflowId`
 - `correlationId`
 - `blobName`
 - `inputContainer`
+- `templateBlobName`
+- `templateContainer`
 - `outputContainer`
-- `templateName`
-- `status`
-- `timestamp`
-
-## Storage Containers
-
-Create these blob containers in your storage account:
-
-- `input`
-- `output`
-- `templates`
+- `processedAtUtc`
+- `errorMessage` (only for failures)
 
 ## Configuration
 
-Configure these settings in `local.settings.json` for local development or in Azure App Settings when deployed.
+Set these values in `local.settings.json` (local) or App Settings (Azure).
 
 ### Required
 
@@ -70,9 +79,12 @@ Configure these settings in `local.settings.json` for local development or in Az
 ### Optional
 
 - `ServiceBusStatusQueueName`
-- `TemplateBlobName`
+- `InputContainerName` (default: `input`)
+- `TemplateContainerName` (default: `template`)
+- `OutputContainerName` (default: `output`)
+- `TemplateBlobName` (default: `default.xslt`)
 
-## Example `local.settings.json`
+### Example `local.settings.json`
 
 ```json
 {
@@ -83,34 +95,24 @@ Configure these settings in `local.settings.json` for local development or in Az
     "ServiceBusConnectionString": "<your-service-bus-connection-string>",
     "ServiceBusQueueName": "document-processing",
     "ServiceBusStatusQueueName": "document-processing-status",
+    "InputContainerName": "input",
+    "TemplateContainerName": "template",
+    "OutputContainerName": "output",
     "TemplateBlobName": "default.xslt"
   }
 }
 ```
 
-## Running Locally
-
-1. Ensure Azure Storage and Service Bus are available.
-2. Create the `input`, `output`, and `templates` containers.
-3. Upload an XSLT file such as `default.xslt` to `templates`.
-4. Start the function app.
-5. Upload an XML file to `input`.
-6. Send a Service Bus message with the processing request JSON.
-
 ## Build
 
-```powershell
+```bash
 dotnet build
+dotnet test
 ```
 
-## Notes
+## Main files
 
-- The current implementation uses `XslCompiledTransform`, which supports XSLT 1.0.
-- Service Bus is the primary workflow trigger and the preferred place for correlation and tracking.
-- Blob Storage is used for document payload storage.
-
-## Main Files
-
-- `Function1.cs` - Service Bus-triggered XML processing function.
-- `Program.cs` - application startup and dependency registration.
-- `TemplateCombine.csproj` - project dependencies.
+- `DocumentProcessorFunction.cs` - Service Bus-triggered XML processing function.
+- `Models/DocumentProcessingRequest.cs` - request contract.
+- `Models/DocumentProcessingStatus.cs` - completion/failure status contract.
+- `Program.cs` - startup and dependency registration.
