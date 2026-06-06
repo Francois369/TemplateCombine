@@ -32,7 +32,7 @@ Expected JSON payload:
 ```json
 {
   "workflowId": "8c4d0f4d-2f40-4a46-a7f8-3b783e0a4f25",
-  "correlationId": "8c4d0f4d-2f40-4a46-a7f8-3b783e0a4f25",
+  "correlationId": "a11c1f03-7569-4f84-b0d0-a2b18ea15af5",
   "blobName": "requests/request-001.xml",
   "inputContainer": "input",
   "templateBlobName": "default.xslt",

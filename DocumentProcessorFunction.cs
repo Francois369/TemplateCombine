@@ -65,8 +65,7 @@ public sealed class DocumentProcessorFunction
         var templateContainerName = ResolveValue(request.TemplateContainer, _defaultTemplateContainer);
         var outputContainerName = ResolveValue(request.OutputContainer, _defaultOutputContainer);
         var templateBlobName = ResolveValue(request.TemplateBlobName, _defaultTemplateBlobName);
-        var workflowId = ResolveIdentifier(request.WorkflowId, GetApplicationProperty(message, "workflowId"), message.MessageId);
-        var correlationId = ResolveIdentifier(request.CorrelationId, message.CorrelationId, workflowId);
+        var (workflowId, correlationId) = ResolveTrackingContext(request, message);
 
         _logger.LogInformation(
             "Starting document processing. WorkflowId={workflowId}, CorrelationId={correlationId}, Blob={blobName}, InputContainer={inputContainer}, Template={templateBlobName}, TemplateContainer={templateContainer}, OutputContainer={outputContainer}",
@@ -165,7 +164,17 @@ public sealed class DocumentProcessorFunction
         {
             _logger.LogError(ex, "Unexpected error processing blob {blobName}.", request.BlobName);
             await PublishStatusMessageAsync(
-                CreateStatusMessage(request, message, "Failed", workflowId, correlationId, inputContainerName, templateContainerName, outputContainerName, templateBlobName, ex.Message));
+                CreateStatusMessage(
+                    request,
+                    message,
+                    "Failed",
+                    workflowId,
+                    correlationId,
+                    inputContainerName,
+                    templateContainerName,
+                    outputContainerName,
+                    templateBlobName,
+                    "Unexpected processing error. Check function logs for details."));
             throw;
         }
     }
@@ -213,7 +222,7 @@ public sealed class DocumentProcessorFunction
             _statusQueueName);
     }
 
-    private static DocumentProcessingStatus CreateStatusMessage(
+    private DocumentProcessingStatus CreateStatusMessage(
         DocumentProcessingRequest request,
         ServiceBusReceivedMessage sourceMessage,
         string status,
@@ -225,16 +234,19 @@ public sealed class DocumentProcessorFunction
         string? templateBlobName = null,
         string? errorMessage = null)
     {
-        var resolvedWorkflowId = ResolveIdentifier(workflowId, request.WorkflowId, GetApplicationProperty(sourceMessage, "workflowId"), sourceMessage.MessageId);
-        var resolvedCorrelationId = ResolveIdentifier(correlationId, request.CorrelationId, sourceMessage.CorrelationId, resolvedWorkflowId);
+        var (resolvedWorkflowId, resolvedCorrelationId) = ResolveTrackingContext(
+            request,
+            sourceMessage,
+            workflowId,
+            correlationId);
 
         return new DocumentProcessingStatus(
             Status: status,
             BlobName: request.BlobName ?? string.Empty,
-            InputContainer: inputContainer ?? request.InputContainer ?? "input",
-            TemplateBlobName: templateBlobName ?? request.TemplateBlobName ?? string.Empty,
-            TemplateContainer: templateContainer ?? request.TemplateContainer ?? "template",
-            OutputContainer: outputContainer ?? request.OutputContainer ?? "output",
+            InputContainer: ResolveValue(inputContainer ?? request.InputContainer, _defaultInputContainer),
+            TemplateBlobName: ResolveValue(templateBlobName ?? request.TemplateBlobName, _defaultTemplateBlobName),
+            TemplateContainer: ResolveValue(templateContainer ?? request.TemplateContainer, _defaultTemplateContainer),
+            OutputContainer: ResolveValue(outputContainer ?? request.OutputContainer, _defaultOutputContainer),
             WorkflowId: resolvedWorkflowId,
             CorrelationId: resolvedCorrelationId,
             ProcessedAtUtc: DateTimeOffset.UtcNow,
@@ -243,6 +255,27 @@ public sealed class DocumentProcessorFunction
 
     private static string ResolveValue(string? value, string fallback) =>
         string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
+
+    private static (string? WorkflowId, string? CorrelationId) ResolveTrackingContext(
+        DocumentProcessingRequest request,
+        ServiceBusReceivedMessage message,
+        string? workflowOverride = null,
+        string? correlationOverride = null)
+    {
+        var workflowId = ResolveIdentifier(
+            workflowOverride,
+            request.WorkflowId,
+            GetApplicationProperty(message, "workflowId"),
+            message.MessageId);
+
+        var correlationId = ResolveIdentifier(
+            correlationOverride,
+            request.CorrelationId,
+            message.CorrelationId,
+            workflowId);
+
+        return (workflowId, correlationId);
+    }
 
     private static string? ResolveIdentifier(params string?[] candidates) =>
         candidates.FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate))?.Trim();
