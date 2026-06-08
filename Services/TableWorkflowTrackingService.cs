@@ -45,9 +45,10 @@ public sealed class TableWorkflowTrackingService : IWorkflowTrackingService
 
         WorkflowTrackingEntity entity;
 
-        if (existingEntity.HasValue && existingEntity.Value is not null)
+        if (existingEntity.HasValue)
         {
-            entity = existingEntity.Value;
+            entity = existingEntity.Value
+                ?? throw new InvalidOperationException($"Workflow tracking entity for '{context.WorkflowId}' was expected but not returned.");
         }
         else
         {
@@ -70,11 +71,6 @@ public sealed class TableWorkflowTrackingService : IWorkflowTrackingService
         entity.UpdatedAtUtc = now;
         entity.CompletedAtUtc = status is WorkflowTrackingStatus.Completed or WorkflowTrackingStatus.Failed ? now : null;
         entity.ErrorMessage = status == WorkflowTrackingStatus.Failed ? Normalize(errorMessage) : null;
-
-        if (entity.CreatedAtUtc == default)
-        {
-            entity.CreatedAtUtc = now;
-        }
 
         try
         {

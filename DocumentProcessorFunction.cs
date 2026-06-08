@@ -346,7 +346,7 @@ public sealed class DocumentProcessorFunction
 
     private static string ResolveIdentifier(params string?[] candidates) =>
         candidates.FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate))?.Trim()
-        ?? Guid.NewGuid().ToString("N");
+        ?? string.Empty;
 
     private static string CreateDeterministicMessageFallback(ServiceBusReceivedMessage message)
     {
