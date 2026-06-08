@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Security.Cryptography;
 using System.Xml;
 using System.Xml.Xsl;
 using Azure.Messaging.ServiceBus;
@@ -7,6 +8,7 @@ using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using TemplateCombine.Models;
+using TemplateCombine.Services;
 
 namespace TemplateCombine;
 
@@ -20,6 +22,7 @@ public sealed class DocumentProcessorFunction
     private readonly ILogger<DocumentProcessorFunction> _logger;
     private readonly BlobServiceClient _blobServiceClient;
     private readonly ServiceBusClient _serviceBusClient;
+    private readonly IWorkflowTrackingService _workflowTrackingService;
     private readonly string _defaultInputContainer;
     private readonly string _defaultTemplateContainer;
     private readonly string _defaultOutputContainer;
@@ -30,11 +33,13 @@ public sealed class DocumentProcessorFunction
         ILogger<DocumentProcessorFunction> logger,
         BlobServiceClient blobServiceClient,
         ServiceBusClient serviceBusClient,
+        IWorkflowTrackingService workflowTrackingService,
         IConfiguration configuration)
     {
         _logger = logger;
         _blobServiceClient = blobServiceClient;
         _serviceBusClient = serviceBusClient;
+        _workflowTrackingService = workflowTrackingService;
         _defaultInputContainer = configuration["InputContainerName"] ?? "input";
         _defaultTemplateContainer = configuration["TemplateContainerName"] ?? "template";
         _defaultOutputContainer = configuration["OutputContainerName"] ?? "output";
@@ -50,14 +55,10 @@ public sealed class DocumentProcessorFunction
         var request = DeserializeRequest(message);
         if (request is null)
         {
-            return;
-        }
-
-        if (string.IsNullOrWhiteSpace(request.BlobName))
-        {
-            _logger.LogError("Invalid processing request. 'blobName' is required.");
-            await PublishStatusMessageAsync(
-                CreateStatusMessage(request, message, "Failed", errorMessage: "blobName is required"));
+            await _workflowTrackingService.TrackAsync(
+                CreateTrackingContext(message),
+                WorkflowTrackingStatus.Failed,
+                "Invalid Service Bus request payload. Expected JSON matching DocumentProcessingRequest schema.");
             return;
         }
 
@@ -66,6 +67,29 @@ public sealed class DocumentProcessorFunction
         var outputContainerName = ResolveValue(request.OutputContainer, _defaultOutputContainer);
         var templateBlobName = ResolveValue(request.TemplateBlobName, _defaultTemplateBlobName);
         var (workflowId, correlationId) = ResolveTrackingContext(request, message);
+        var trackingContext = CreateTrackingContext(
+            message,
+            request,
+            workflowId,
+            correlationId,
+            inputContainerName,
+            templateContainerName,
+            outputContainerName,
+            templateBlobName);
+
+        await _workflowTrackingService.TrackAsync(trackingContext, WorkflowTrackingStatus.Queued);
+
+        if (string.IsNullOrWhiteSpace(request.BlobName))
+        {
+            _logger.LogError("Invalid processing request. 'blobName' is required.");
+            await _workflowTrackingService.TrackAsync(
+                trackingContext,
+                WorkflowTrackingStatus.Failed,
+                "blobName is required");
+            await PublishStatusMessageAsync(
+                CreateStatusMessage(request, message, "Failed", workflowId, correlationId, inputContainerName, templateContainerName, outputContainerName, templateBlobName, "blobName is required"));
+            return;
+        }
 
         _logger.LogInformation(
             "Starting document processing. WorkflowId={workflowId}, CorrelationId={correlationId}, Blob={blobName}, InputContainer={inputContainer}, Template={templateBlobName}, TemplateContainer={templateContainer}, OutputContainer={outputContainer}",
@@ -77,6 +101,8 @@ public sealed class DocumentProcessorFunction
             templateContainerName,
             outputContainerName);
 
+        await _workflowTrackingService.TrackAsync(trackingContext, WorkflowTrackingStatus.Processing);
+
         try
         {
             var inputBlob = _blobServiceClient
@@ -87,6 +113,7 @@ public sealed class DocumentProcessorFunction
             {
                 var errorMessage = $"Input blob '{request.BlobName}' was not found in container '{inputContainerName}'.";
                 _logger.LogError(errorMessage);
+                await _workflowTrackingService.TrackAsync(trackingContext, WorkflowTrackingStatus.Failed, errorMessage);
                 await PublishStatusMessageAsync(
                     CreateStatusMessage(request, message, "Failed", workflowId, correlationId, inputContainerName, templateContainerName, outputContainerName, templateBlobName, errorMessage));
                 return;
@@ -100,6 +127,7 @@ public sealed class DocumentProcessorFunction
             {
                 var errorMessage = $"Template blob '{templateBlobName}' was not found in container '{templateContainerName}'.";
                 _logger.LogError(errorMessage);
+                await _workflowTrackingService.TrackAsync(trackingContext, WorkflowTrackingStatus.Failed, errorMessage);
                 await PublishStatusMessageAsync(
                     CreateStatusMessage(request, message, "Failed", workflowId, correlationId, inputContainerName, templateContainerName, outputContainerName, templateBlobName, errorMessage));
                 return;
@@ -157,12 +185,17 @@ public sealed class DocumentProcessorFunction
                 request.BlobName,
                 outputContainerName);
 
+            await _workflowTrackingService.TrackAsync(trackingContext, WorkflowTrackingStatus.Completed);
             await PublishStatusMessageAsync(
                 CreateStatusMessage(request, message, "Completed", workflowId, correlationId, inputContainerName, templateContainerName, outputContainerName, templateBlobName));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error processing blob {blobName}.", request.BlobName);
+            await _workflowTrackingService.TrackAsync(
+                trackingContext,
+                WorkflowTrackingStatus.Failed,
+                "Unexpected processing error. Check function logs for details.");
             await PublishStatusMessageAsync(
                 CreateStatusMessage(
                     request,
@@ -253,32 +286,74 @@ public sealed class DocumentProcessorFunction
             ErrorMessage: errorMessage);
     }
 
+    private WorkflowTrackingContext CreateTrackingContext(
+        ServiceBusReceivedMessage message,
+        DocumentProcessingRequest? request = null,
+        string? workflowId = null,
+        string? correlationId = null,
+        string? inputContainer = null,
+        string? templateContainer = null,
+        string? outputContainer = null,
+        string? templateBlobName = null)
+    {
+        var (resolvedWorkflowId, resolvedCorrelationId) = ResolveTrackingContext(
+            request,
+            message,
+            workflowId,
+            correlationId);
+
+        return new WorkflowTrackingContext(
+            WorkflowId: resolvedWorkflowId,
+            CorrelationId: resolvedCorrelationId,
+            InputContainer: ResolveValue(inputContainer ?? request?.InputContainer, _defaultInputContainer),
+            InputBlobName: request?.BlobName?.Trim(),
+            TemplateContainer: ResolveValue(templateContainer ?? request?.TemplateContainer, _defaultTemplateContainer),
+            TemplateBlobName: ResolveValue(templateBlobName ?? request?.TemplateBlobName, _defaultTemplateBlobName),
+            OutputContainer: ResolveValue(outputContainer ?? request?.OutputContainer, _defaultOutputContainer),
+            OutputBlobName: request?.BlobName?.Trim(),
+            ServiceBusMessageId: message.MessageId?.Trim());
+    }
+
     private static string ResolveValue(string? value, string fallback) =>
         string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
 
-    private static (string? WorkflowId, string? CorrelationId) ResolveTrackingContext(
-        DocumentProcessingRequest request,
+    private static (string WorkflowId, string? CorrelationId) ResolveTrackingContext(
+        DocumentProcessingRequest? request,
         ServiceBusReceivedMessage message,
         string? workflowOverride = null,
         string? correlationOverride = null)
     {
         var workflowId = ResolveIdentifier(
             workflowOverride,
-            request.WorkflowId,
+            request?.WorkflowId,
             GetApplicationProperty(message, "workflowId"),
-            message.MessageId);
+            request?.CorrelationId,
+            GetApplicationProperty(message, "correlationId"),
+            message.CorrelationId,
+            message.MessageId,
+            CreateDeterministicMessageFallback(message));
 
         var correlationId = ResolveIdentifier(
             correlationOverride,
-            request.CorrelationId,
+            request?.CorrelationId,
+            GetApplicationProperty(message, "correlationId"),
             message.CorrelationId,
-            workflowId);
+            workflowId,
+            message.MessageId);
 
         return (workflowId, correlationId);
     }
 
-    private static string? ResolveIdentifier(params string?[] candidates) =>
-        candidates.FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate))?.Trim();
+    private static string ResolveIdentifier(params string?[] candidates) =>
+        candidates.FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate))?.Trim()
+        ?? string.Empty;
+
+    private static string CreateDeterministicMessageFallback(ServiceBusReceivedMessage message)
+    {
+        var bodyBytes = message.Body.ToMemory().ToArray();
+        var hashBytes = SHA256.HashData(bodyBytes);
+        return Convert.ToHexString(hashBytes);
+    }
 
     private static string? GetApplicationProperty(ServiceBusReceivedMessage message, string key)
     {
