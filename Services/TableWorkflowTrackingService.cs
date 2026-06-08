@@ -9,6 +9,8 @@ public sealed class TableWorkflowTrackingService : IWorkflowTrackingService
 {
     private readonly TableClient _tableClient;
     private readonly ILogger<TableWorkflowTrackingService> _logger;
+    private readonly SemaphoreSlim _tableInitializationLock = new(1, 1);
+    private bool _tableInitialized;
 
     public TableWorkflowTrackingService(TableClient tableClient, ILogger<TableWorkflowTrackingService> logger)
     {
@@ -24,7 +26,7 @@ public sealed class TableWorkflowTrackingService : IWorkflowTrackingService
     {
         ArgumentNullException.ThrowIfNull(context);
 
-        await _tableClient.CreateIfNotExistsAsync(cancellationToken);
+        await EnsureTableExistsAsync(cancellationToken);
 
         var now = DateTimeOffset.UtcNow;
         var rowKey = WorkflowTrackingEntity.CreateRowKey(context.WorkflowId);
@@ -89,4 +91,29 @@ public sealed class TableWorkflowTrackingService : IWorkflowTrackingService
 
     private static string? Normalize(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private async Task EnsureTableExistsAsync(CancellationToken cancellationToken)
+    {
+        if (_tableInitialized)
+        {
+            return;
+        }
+
+        await _tableInitializationLock.WaitAsync(cancellationToken);
+
+        try
+        {
+            if (_tableInitialized)
+            {
+                return;
+            }
+
+            await _tableClient.CreateIfNotExistsAsync(cancellationToken);
+            _tableInitialized = true;
+        }
+        finally
+        {
+            _tableInitializationLock.Release();
+        }
+    }
 }
